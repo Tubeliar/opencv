@@ -506,6 +506,7 @@ struct HOGCache
     Rect getWindow(const Size& imageSize, const Size& winStride, int idx) const;
 
     const float* getBlock(Point pt, float* buf);
+    void normaliseL(int L, float* histogram) const;
     virtual void normalizeBlockHistogram(float* histogram) const;
 
     std::vector<PixData> pixData;
@@ -958,99 +959,222 @@ const float* HOGCache::getBlock(Point pt, float* buf)
     return blockHist;
 }
 
-void HOGCache::normalizeBlockHistogram(float* _hist) const
+#define epsilon 0.001f
+void HOGCache::normaliseL(int L, float* hist) const
 {
-    float* hist = &_hist[0], sum = 0.0f, partSum[4];
-    size_t i = 0, sz = blockHistogramSize;
+    float sum = 0.0f;
+    float partSum[4];
+    int i;
+    float scale;
 
-#if CV_SSE2
-    __m128 p0 = _mm_loadu_ps(hist);
-    __m128 s = _mm_mul_ps(p0, p0);
-
-    for (i = 4; i <= sz - 4; i += 4)
-    {
-        p0 = _mm_loadu_ps(hist + i);
-        s = _mm_add_ps(s, _mm_mul_ps(p0, p0));
-    }
-    _mm_storeu_ps(partSum, s);
-#else
+#if !CV_SSE2
     partSum[0] = 0.0f;
     partSum[1] = 0.0f;
     partSum[2] = 0.0f;
     partSum[3] = 0.0f;
-    for ( ; i <= sz - 4; i += 4)
-    {
-        partSum[0] += hist[i] * hist[i];
-        partSum[1] += hist[i+1] * hist[i+1];
-        partSum[2] += hist[i+2] * hist[i+2];
-        partSum[3] += hist[i+3] * hist[i+3];
-    }
 #endif
-    float t0 = partSum[0] + partSum[1];
-    float t1 = partSum[2] + partSum[3];
-    sum = t0 + t1;
-    for ( ; i < sz; ++i)
-        sum += hist[i]*hist[i];
+    //////////////////////////////////////////
+    // Determine the norm length and the scale
+    //////////////////////////////////////////
+    switch (L)
+    {
+    default:
+    case 2:
+        // L2 norm
+        // Square values and sum. Use the square root for scale.
+#if CV_SSE2
+        // Create a scope for p0 and s
+        {
+            __m128 p0 = _mm_loadu_ps(hist);
+            __m128 s = _mm_mul_ps(p0, p0);
 
-    float scale = 1.f/(std::sqrt(sum)+sz*0.1f), thresh = (float)descriptor->L2HysThreshold;
-    i = 0, sum = 0.0f;
+            for (i = 4; i <= blockHistogramSize - 4; i += 4)
+            {
+                p0 = _mm_loadu_ps(hist + i);
+                s = _mm_add_ps(s, _mm_mul_ps(p0, p0));
+            }
+            _mm_storeu_ps(partSum, s);
+        }
+#else
+        for (i = 0; i <= blockHistogramSize - 4; i += 4)
+        {
+            partSum[0] += hist[i] * hist[i];
+            partSum[1] += hist[i+1] * hist[i+1];
+            partSum[2] += hist[i+2] * hist[i+2];
+            partSum[3] += hist[i+3] * hist[i+3];
+        }
+#endif
+        // Add the unrolled or SSE optimised partial sums
+        sum = partSum[0] + partSum[1] + partSum[2] + partSum[3];
+        // Add any remaining values if the histogram size was not a clean multiple of 4
+        for (/* i is where we left off */; i < blockHistogramSize; ++i)
+        {
+            sum += hist[i] * hist[i];
+        }
 
+        // This used to be 1.f / (std::sqrt(sum) + blockHistogramSize * 0.1f)
+        // However, Dalal & Triggs specified that epsilon ("a small constant")
+        // should only be added once per histogram, not once per element.
+        // Moreover for L2Hys epsilon squared should be added to the L2 norm before
+        // taking the square root.
+        scale = 1.f / (std::sqrt(sum + epsilon * epsilon));
+        break;
+
+    case 1:
+         // L1 norm
+        // Just sum the values
+#if CV_SSE2
+        __m128 s = _mm_loadu_ps(hist);
+        for (i = 4; i <= blockHistogramSize - 4; i += 4)
+        {
+            s = _mm_add_ps(s, _mm_loadu_ps(hist + i));
+        }
+        _mm_storeu_ps(partSum, s);
+#else
+        for (i = 0; i <= blockHistogramSize - 4; i += 4)
+        {
+            partSum[0] += hist[i];
+            partSum[1] += hist[i+1];
+            partSum[2] += hist[i+2];
+            partSum[3] += hist[i+3];
+        }
+#endif
+        // Add the unrolled or SSE optimised partial sums
+        sum = partSum[0] + partSum[1] + partSum[2] + partSum[3];
+        // Add any remaining values if the histogram size was not a clean multiple of 4
+        for (/* i is where we left off */; i < blockHistogramSize; ++i)
+        {
+            sum += hist[i];
+        }
+
+        // Add epsilon to avoid the chance of division by zero.
+        scale = 1.f / (sum + epsilon);
+        break;
+    }
+
+    //////////////////////////////////////////
+    // Now that we have the scale we can perform the actual normalisation.
+    //////////////////////////////////////////
 #if CV_SSE2
     __m128 _scale = _mm_set1_ps(scale);
-    static __m128 _threshold = _mm_set1_ps(thresh);
-
-    __m128 p = _mm_mul_ps(_scale, _mm_loadu_ps(hist));
-    p = _mm_min_ps(p, _threshold);
-    s = _mm_mul_ps(p, p);
-    _mm_storeu_ps(hist, p);
-
-    for(i = 4 ; i <= sz - 4; i += 4)
+    __m128 p;
+    for(i = 0 ; i <= blockHistogramSize - 4; i += 4)
     {
-        p = _mm_loadu_ps(hist + i);
-        p = _mm_mul_ps(p, _scale);
-        p = _mm_min_ps(p, _threshold);
-        s = _mm_add_ps(s, _mm_mul_ps(p, p));
-        _mm_storeu_ps(hist + i, p);
+        p = _mm_mul_ps(_scale, _mm_loadu_ps(hist + i)); // scale
+        _mm_storeu_ps(hist + i, p); // store scaled values
     }
-
-    _mm_storeu_ps(partSum, s);
 #else
-    partSum[0] = 0.0f;
-    partSum[1] = 0.0f;
-    partSum[2] = 0.0f;
-    partSum[3] = 0.0f;
-    for( ; i <= sz - 4; i += 4)
+    for(i = 0; i <= blockHistogramSize - 4; i += 4)
     {
-        hist[i] = std::min(hist[i]*scale, thresh);
-        hist[i+1] = std::min(hist[i+1]*scale, thresh);
-        hist[i+2] = std::min(hist[i+2]*scale, thresh);
-        hist[i+3] = std::min(hist[i+3]*scale, thresh);
-        partSum[0] += hist[i]*hist[i];
-        partSum[1] += hist[i+1]*hist[i+1];
-        partSum[2] += hist[i+2]*hist[i+2];
-        partSum[3] += hist[i+3]*hist[i+3];
+        hist[i] = hist[i] * scale;
+        hist[i+1] = hist[i+1] * scale;
+        hist[i+2] = hist[i+2] * scale;
+        hist[i+3] = hist[i+3] * scale;
     }
 #endif
-    t0 = partSum[0] + partSum[1];
-    t1 = partSum[2] + partSum[3];
-    sum = t0 + t1;
-    for( ; i < sz; ++i)
+    // Finish any remaining elements for block histogram sizes that are not multiples of 4
+    for(/* i is where we left off */; i < blockHistogramSize; ++i)
     {
-        hist[i] = std::min(hist[i]*scale, thresh);
-        sum += hist[i]*hist[i];
+        hist[i] = hist[i] * scale;
     }
+}
 
-    scale = 1.f/(std::sqrt(sum)+1e-3f), i = 0;
-#if CV_SSE2
-    __m128 _scale2 = _mm_set1_ps(scale);
-    for ( ; i <= sz - 4; i += 4)
+void HOGCache::normalizeBlockHistogram(float* hist) const
+{
+    int L = 0;
+    switch (descriptor->histogramNormType)
     {
-        __m128 t = _mm_mul_ps(_scale2, _mm_loadu_ps(hist + i));
-        _mm_storeu_ps(hist + i, t);
+    default:
+    case HOGDescriptor::L2Hys:
+    case HOGDescriptor::L2Norm:
+        L = 2;
+        break;
+
+    case HOGDescriptor::L1Hys:
+    case HOGDescriptor::L1Sqrt:
+    case HOGDescriptor::L1Norm:
+        L = 1;
+        break;
+
+    case HOGDescriptor::None:
+        return;
     }
+    // Normalise the first time
+    normaliseL(L, hist);
+
+    // Apply any transformations
+    int i; // An element counter
+#if CV_SSE2
+    __m128 p; // A register for intermediate results
 #endif
-    for ( ; i < sz; ++i)
-        hist[i] *= scale;
+    switch (descriptor->histogramNormType)
+    {
+    case HOGDescriptor::L2Norm:
+    case HOGDescriptor::L1Norm:
+    default:
+        ////////////////////////////////////////////
+        // No transformation necessary, we are done.
+        ////////////////////////////////////////////
+        return;
+
+    case HOGDescriptor::L2Hys:
+    case HOGDescriptor::L1Hys:
+        ////////////////////////////////////////////
+        // Cut the values and normalise again
+        ////////////////////////////////////////////
+        {
+            float thresh = static_cast<float>(descriptor->L2HysThreshold);
+#if CV_SSE2
+            static __m128 _threshold = _mm_set1_ps(thresh);
+            for(i = 0; i <= blockHistogramSize - 4; i += 4)
+            {
+                p = _mm_min_ps(_mm_loadu_ps(hist + i), _threshold); // cut
+                _mm_storeu_ps(hist + i, p); // store cut values
+            }
+#else
+            for(i = 0; i <= blockHistogramSize - 4; i += 4)
+            {
+                hist[i] = std::min(hist[i], thresh);
+                hist[i+1] = std::min(hist[i+1], thresh);
+                hist[i+2] = std::min(hist[i+2], thresh);
+                hist[i+3] = std::min(hist[i+3], thresh);
+            }
+#endif
+            for(/* i is where we left off */; i < blockHistogramSize; ++i)
+            {
+                hist[i] = std::min(hist[i], thresh);
+            }
+        }
+
+        // Renormalise
+        normaliseL(L, hist);
+        return;
+
+    case HOGDescriptor::L1Sqrt:
+        ////////////////////////////////////////////
+        // Take the square root on all elements
+        ////////////////////////////////////////////
+#if CV_SSE2
+        for(i = 0; i <= blockHistogramSize - 4; i += 4)
+        {
+            p = _mm_sqrt_ps(_mm_loadu_ps(hist + i));
+            _mm_storeu_ps(hist + i, p);
+        }
+#else
+        for(i = 0; i <= blockHistogramSize - 4; i += 4)
+        {
+            hist[i] = std::sqrt(hist[i]);
+            hist[i+1] = std::sqrt(hist[i+1]);
+            hist[i+2] = std::sqrt(hist[i+2]);
+            hist[i+3] = std::sqrt(hist[i+3]);
+        }
+#endif
+        for(/* i is where we left off */; i < blockHistogramSize; ++i)
+        {
+            hist[i] = std::sqrt(hist[i]);
+        }
+        return;
+    }
 }
 
 Size HOGCache::windowsInImage(const Size& imageSize, const Size& winStride) const

@@ -337,7 +337,12 @@ struct DetectionROI
 struct CV_EXPORTS_W HOGDescriptor
 {
 public:
-    enum { L2Hys = 0
+    enum { L2Hys = 0,
+           L2Norm,
+           L1Hys,
+           L1Sqrt,
+           L1Norm,
+           None
          };
     enum { DEFAULT_NLEVELS = 64
          };
